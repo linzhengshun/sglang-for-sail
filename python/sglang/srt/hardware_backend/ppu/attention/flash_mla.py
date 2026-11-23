@@ -8,7 +8,10 @@ Exported symbols
 get_mla_metadata
 flash_mla_with_kvcache
 flash_mla_sparse_fwd
+flash_mla_sparse_quantized_fwd
 """
+
+from __future__ import annotations
 
 from typing import Optional, Tuple
 
@@ -228,3 +231,40 @@ def flash_mla_sparse_fwd(
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
+
+
+def require_sparse_fp8_attention() -> None:
+    if _import_error is not None:
+        raise _IMPORT_ERROR from _import_error
+    if not all(
+        callable(getattr(_flashmla, name, None))
+        for name in ("flash_mla_sparse_quantized_fwd", "QuantizedAttentionConfig")
+    ):
+        raise RuntimeError(
+            "PPU flashmla_sparse_q8 requires a FlashMLA wheel with "
+            "flash_mla_sparse_quantized_fwd and QuantizedAttentionConfig."
+        )
+
+
+def flash_mla_sparse_quantized_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Native PPU sparse attention over raw E4M3 Q and KV; return only output."""
+    out, _, _ = _flashmla.flash_mla_sparse_quantized_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        quantization=_flashmla.QuantizedAttentionConfig(q_scale=1.0, kv_scale=1.0),
+        d_v=d_v,
+        attn_sink=None,
+        topk_length=topk_length,
+        out=None,
+        compute_aux=False,
+    )
+    return out
