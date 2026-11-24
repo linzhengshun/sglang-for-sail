@@ -59,11 +59,16 @@ def _pla_host_offsets(
     return tuple(offsets)
 
 
-def _load_flash_kda():
-    """Import the optional ``flash_kda`` CUTLASS module."""
+def _load_flash_kda(*, ppu: bool = False):
+    """Import the optional ``flash_kda`` module."""
     try:
         import flash_kda
     except ImportError as e:
+        if ppu:
+            raise ImportError(
+                "Explicit FlashKDA on PPU SM89 requires the PPU FlashKDA wheel "
+                "built from 0dfef21."
+            ) from e
         raise ImportError(
             "The 'flashkda' KDA prefill backend requires the flash_kda module, "
             "which is not installed. Install it from source:\n"
@@ -394,3 +399,245 @@ class FlashKDAKernel(LinearAttnKernelBase):
 
         # out_buf is already [1, packed_seq, HV, V].
         return out_buf
+
+
+class PPUFlashKDAKernel(FlashKDAKernel):
+    """Explicit PPU SM89 backend using the external FlashKDA package, not PLA."""
+
+    supports_packed_decode = True
+    supports_packed_decode_safe_gate = True
+    supports_safe_gate_verify = True
+
+    def packed_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        lower_bound: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_size = mixed_qkv.shape[0]
+        out = mixed_qkv.new_empty((batch_size, 1, num_v_heads, head_v_dim))
+        if batch_size == 0:
+            return out.transpose(0, 1)
+
+        flash_kda = _load_flash_kda(ppu=True)
+        if not getattr(flash_kda, "DECODE_SUPPORTS_LOWER_BOUND", False):
+            raise RuntimeError(
+                "PPU FlashKDA decode requires the bounded decode ABI (0dfef21)."
+            )
+        flash_kda.decode(
+            mixed_qkv.contiguous(),
+            a.reshape(batch_size, num_v_heads * head_v_dim).contiguous(),
+            b.reshape(batch_size, num_v_heads).contiguous(),
+            A_log.reshape(-1).float().contiguous(),
+            dt_bias.reshape(-1).float().contiguous(),
+            scale,
+            ssm_states,
+            cache_indices.to(torch.int32).contiguous(),
+            out,
+            lower_bound=lower_bound,
+        )
+        return out.transpose(0, 1)
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        A_log: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+        lower_bound: Optional[float] = None,
+        is_spec_decode: bool = False,
+        beta_is_raw: bool = False,
+        return_intermediate_states: bool = False,
+        track_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
+        state_chunk_size: int = _FLASHKDA_CHUNK_SIZE,
+        **kwargs,
+    ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (track_state is None) != (track_chunk_idx is None):
+            raise ValueError("FlashKDA track_state and track_chunk_idx must be paired")
+        if track_state is not None and state_chunk_size != _FLASHKDA_CHUNK_SIZE:
+            raise ValueError("FlashKDA radix checkpoints require 64-token chunks")
+
+        # Aligned rows only read final_state; unaligned rows fall back to the
+        # existing Triton intermediate-state path.
+        use_native = (
+            lower_bound is not None
+            and not is_spec_decode
+            and (not return_intermediate_states or track_state is not None)
+        )
+        if use_native:
+            flash_kda = _load_flash_kda(ppu=True)
+            if not getattr(flash_kda, "SUPPORTS_BF16_STATE_ACCUMULATION", False):
+                raise RuntimeError(
+                    "PPU FlashKDA prefill requires BF16 state accumulation support."
+                )
+            if track_state is not None:
+                use_native = False
+        if not use_native:
+            return _triton_fallback(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                beta_is_raw=beta_is_raw,
+                return_intermediate_states=return_intermediate_states,
+                track_state=track_state,
+                track_chunk_idx=track_chunk_idx,
+            )
+        if not beta_is_raw:
+            beta = torch.logit(beta.float().clamp_(1e-7, 1.0 - 1e-7))
+        heads, head_dim = q.shape[-2:]
+        # Keep the fused-QKV views: 0dfef21 accepts packed token-row strides.
+        q, k, v = (
+            (
+                x
+                if x.stride()[-2:] == (128, 1)
+                and x.stride(1) >= heads * 128
+                and x.stride(1) % 64 == 0
+                else x.contiguous()
+            )
+            for x in (q, k, v)
+        )
+        out = v.new_empty(v.shape)
+        initial_state = ssm_states[cache_indices].contiguous()
+        final_state = torch.empty_like(initial_state)
+        flash_kda.fwd(
+            q,
+            k,
+            v,
+            g.contiguous(),
+            beta.to(torch.bfloat16).contiguous(),
+            head_dim**-0.5,
+            out,
+            A_log.reshape(-1).float().contiguous(),
+            dt_bias.reshape(heads, -1).float().contiguous(),
+            lower_bound,
+            initial_state=initial_state,
+            final_state=final_state,
+            cu_seqlens=query_start_loc.to(torch.int64),
+            state_accum_dtype=torch.bfloat16,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+        )
+        ssm_states[cache_indices] = final_state
+        return (out, None) if return_intermediate_states else out
+
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_states_buffer: Optional[torch.Tensor],
+        intermediate_state_indices: torch.Tensor,
+        cache_steps: int,
+        retrieve_parent_token: Optional[torch.Tensor],
+        lower_bound: Optional[float] = None,
+        is_ragged_verify: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_size = query_start_loc.numel() - 1
+        _, seq_len, heads, head_dim = q.shape
+        if a.ndim == 3 and a.shape == (1, seq_len, heads * head_dim):
+            a = a.unflatten(-1, (heads, head_dim))
+        dense = (
+            not is_ragged_verify
+            and retrieve_parent_token is None
+            and lower_bound is not None
+            and q.shape[0] == 1
+            and seq_len == batch_size * cache_steps
+            and head_dim == 128
+            and ssm_states.is_contiguous()
+            and all(
+                x.shape == q.shape and x.dtype == torch.bfloat16 for x in (q, k, v, a)
+            )
+            and b.shape == (1, seq_len, heads)
+            and b.dtype == torch.bfloat16
+        )
+        if intermediate_states_buffer is None:
+            raise RuntimeError("FlashKDA verify cannot use a raw-input ReplaySSM ring")
+        elif (
+            dense
+            and intermediate_states_buffer.is_contiguous()
+            and intermediate_states_buffer.dtype == ssm_states.dtype
+            and batch_size * heads <= 768
+        ):
+            verify = _load_flash_kda(ppu=True).verify_strided
+            verify_args = (
+                intermediate_states_buffer,
+                intermediate_state_indices[:batch_size].to(torch.int32).contiguous(),
+            )
+        else:
+            from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+                TritonKDAKernel,
+            )
+
+            return TritonKDAKernel().target_verify(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=cache_steps,
+                retrieve_parent_token=retrieve_parent_token,
+                lower_bound=lower_bound,
+                **kwargs,
+            )
+        if batch_size == 0:
+            return torch.empty_like(q)
+        dense_shape = (batch_size, cache_steps, heads, 128)
+        out = q.new_empty(dense_shape)
+        verify(
+            q.view(dense_shape),
+            k.view(dense_shape),
+            v.view(dense_shape),
+            a.view(dense_shape),
+            b.reshape(batch_size, cache_steps, heads).contiguous(),
+            A_log.reshape(-1).float().contiguous(),
+            dt_bias.reshape(heads, 128).float().contiguous(),
+            128**-0.5,
+            lower_bound,
+            ssm_states,
+            cache_indices[:batch_size].to(torch.int32).contiguous(),
+            *verify_args,
+            out,
+        )
+        return out.flatten(0, 1).unsqueeze(0)

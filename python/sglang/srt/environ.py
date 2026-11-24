@@ -2332,8 +2332,8 @@ class Envs:
     # prefill/extend path (kda_flashkda.FlashKDAKernel ->
     # pla.prefill.flashkdapro.flashkda_fwd). PPU defaults it to True in
     # platform_hook, so PLA is on out of the box; set it to 0 to send decode
-    # and prefill back to the community Triton kernels together. An explicit
-    # --linear-attn-prefill-backend still wins for the prefill side alone.
+    # and prefill back to the community Triton kernels together. Explicit
+    # FlashKDA on PPU SM89 uses the external package independently of this gate.
     SGLANG_SAIL_PLA_CUDA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_SAIL_FLA_CUDA"
     )
