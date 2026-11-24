@@ -1438,9 +1438,8 @@ class Envs:
     # Everything here is a developer knob for working ON kernels -- building
     # them, inspecting what the compiler produced, and benchmarking them. Flags
     # that select a kernel in production live with their own feature instead.
-    # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
-    # point it at a persistent mount to share builds across CI jobs.
-    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # JIT kernel build cache. Tracks SGLANG_CACHE_DIR unless explicitly set.
+    SGLANG_JIT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("jit"))
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
@@ -1519,6 +1518,8 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    SGLANG_OPT_ULTRA_EP_PPU = EnvBool(False)
+    SGLANG_OPT_ULTRA_EP_PPU_REDUNDANT_PER_RANK = EnvInt(0)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
