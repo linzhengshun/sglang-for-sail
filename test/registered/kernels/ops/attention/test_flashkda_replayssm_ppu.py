@@ -12,7 +12,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-@pytest.mark.skipif(not is_sail(), reason="PPU SM89 kernel is required")
+@pytest.mark.skipif(
+    not is_sail() or torch.cuda.get_device_capability() != (8, 9),
+    reason="PPU SM89 kernel is required",
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_flashkda_replayssm_commit_accept_prefix_and_tracks(dtype) -> None:
     torch.manual_seed(29)

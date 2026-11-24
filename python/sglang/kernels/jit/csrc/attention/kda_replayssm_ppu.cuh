@@ -160,11 +160,11 @@ SGL_DEVICE void produce_token(
     float2 a = bf16x2_to_float2(*reinterpret_cast<uint32_t const*>(gate + gate_base + col));
     float2 dt = *reinterpret_cast<float2 const*>(dt_bias + head * kD + col);
     float2 d = make_float2(
-        __expf(lower_bound * __ppu_sgmdf(exp_A * (a.x + dt.x))),
-        __expf(lower_bound * __ppu_sgmdf(exp_A * (a.y + dt.y))));
+        __expf(lower_bound * sigmoid(exp_A * (a.x + dt.x))),
+        __expf(lower_bound * sigmoid(exp_A * (a.y + dt.y))));
     *reinterpret_cast<float2*>(sm_decay + col) = d;
     if (warp == 1 && lane == 0) {
-      sm_beta[0] = __ppu_sgmdf(float(beta[token * H + head]));
+      sm_beta[0] = sigmoid(float(beta[token * H + head]));
     }
   } else if (warp == 3) {
     // The scratch tail is 16-byte aligned without increasing its rounded
@@ -184,6 +184,106 @@ SGL_DEVICE void save4(State* dst, float4 h) {
     const auto lo = __floats2bfloat162_rn(h.x, h.y), hi = __floats2bfloat162_rn(h.z, h.w);
     *reinterpret_cast<uint2*>(dst) =
         make_uint2(*reinterpret_cast<const uint32_t*>(&lo), *reinterpret_cast<const uint32_t*>(&hi));
+  }
+}
+
+SGL_DEVICE float dot4(float4 h, float4 k) {
+  return h.x * k.x + h.y * k.y + h.z * k.z + h.w * k.w;
+}
+
+template <typename State>
+__global__ void verify_kernel(Verify<State> p) {
+  constexpr int Rows = 16;
+  const int row_base = blockIdx.x * Rows, head = blockIdx.y, batch = blockIdx.z;
+  const int lane = threadIdx.x, warp = threadIdx.y, half = lane >> 4, hl = lane & 15, col = hl * 8;
+  const int slot = p.indices[batch];
+  if (slot < 0) {
+    for (int t = 0; t < p.T; ++t)
+      if (warp == 0 && lane < Rows)
+        p.out[((int64_t(batch) * p.T + t) * p.H + head) * 128 + row_base + lane] = BF16(0.f);
+    return;
+  }
+  assert(slot < p.slots);
+  __shared__ float sq[128], sk[128], sd[128], sb[4];
+  __shared__ BF16 sv[Rows];
+  float4 h0[2], h1[2];
+#pragma unroll
+  for (int g = 0; g < 2; ++g) {
+    const int row = row_base + warp * 2 + half + g * 8;
+    const State* src = p.state + (int64_t(slot) * p.H + head) * 128 * 128 + row * 128 + col;
+    h0[g] = load_state4(src);
+    h1[g] = load_state4(src + 4);
+  }
+  const float exp_A = __shfl_sync(0xffffffffu, lane == 0 ? __expf(p.A[head]) : 0.f, 0);
+  for (int t = 0; t < p.T; ++t) {
+    const int64_t ring = ((int64_t(slot) * p.H + head) * p.L + t) * 128;
+    produce_token<Rows>(
+        p.q,
+        p.k,
+        p.v,
+        p.a,
+        p.b,
+        p.dt,
+        exp_A,
+        0.08838834764831844f,
+        p.lower,
+        batch * p.T + t,
+        head,
+        p.H,
+        p.qs,
+        p.ks,
+        p.vs,
+        p.as,
+        row_base,
+        warp,
+        lane,
+        sq,
+        sk,
+        sd,
+        sb,
+        sv);
+    __syncthreads();
+    if (blockIdx.x == 0 && warp == 3) {
+      *reinterpret_cast<float4*>(p.key + ring + lane * 4) = *reinterpret_cast<const float4*>(sk + lane * 4);
+      *reinterpret_cast<float4*>(p.decay + ring + lane * 4) = *reinterpret_cast<const float4*>(sd + lane * 4);
+    }
+    const float4 q0 = *reinterpret_cast<const float4*>(sq + col), q1 = *reinterpret_cast<const float4*>(sq + col + 4);
+    const float4 k0 = *reinterpret_cast<const float4*>(sk + col), k1 = *reinterpret_cast<const float4*>(sk + col + 4);
+    const float4 d0 = *reinterpret_cast<const float4*>(sd + col), d1 = *reinterpret_cast<const float4*>(sd + col + 4);
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      const int row = warp * 2 + half + g * 8;
+      float4& x0 = h0[g];
+      float4& x1 = h1[g];
+      x0.x = __fmul_rn(x0.x, d0.x);
+      x0.y = __fmul_rn(x0.y, d0.y);
+      x0.z = __fmul_rn(x0.z, d0.z);
+      x0.w = __fmul_rn(x0.w, d0.w);
+      x1.x = __fmul_rn(x1.x, d1.x);
+      x1.y = __fmul_rn(x1.y, d1.y);
+      x1.z = __fmul_rn(x1.z, d1.z);
+      x1.w = __fmul_rn(x1.w, d1.w);
+      float hk = half_sum_down(dot4(x0, k0) + dot4(x1, k1));
+      hk = __shfl_sync(0xffffffffu, hk, half * 16);
+      const float u = (float(sv[row]) - hk) * sb[0];
+      if (hl == 0) p.correction[ring + row_base + row] = u;
+      x0.x = __fmaf_rn(k0.x, u, x0.x);
+      x0.y = __fmaf_rn(k0.y, u, x0.y);
+      x0.z = __fmaf_rn(k0.z, u, x0.z);
+      x0.w = __fmaf_rn(k0.w, u, x0.w);
+      x1.x = __fmaf_rn(k1.x, u, x1.x);
+      x1.y = __fmaf_rn(k1.y, u, x1.y);
+      x1.z = __fmaf_rn(k1.z, u, x1.z);
+      x1.w = __fmaf_rn(k1.w, u, x1.w);
+      const float hq = half_sum_down(dot4(x0, q0) + dot4(x1, q1));
+      if (hl == 0) p.out[((int64_t(batch) * p.T + t) * p.H + head) * 128 + row_base + row] = BF16(hq);
+      if (p.snapshots) {
+        State* dst = p.snapshots + ((int64_t(batch) * p.T + t) * p.H + head) * 128 * 128 + (row_base + row) * 128 + col;
+        save4(dst, x0);
+        save4(dst + 4, x1);
+      }
+    }
+    __syncthreads();
   }
 }
 
