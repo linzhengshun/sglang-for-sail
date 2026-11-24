@@ -2337,6 +2337,8 @@ class Envs:
     SGLANG_SAIL_PLA_CUDA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_SAIL_FLA_CUDA"
     )
+    # External FlashKDA verify writes FP32 correction records instead of the PLA/raw ring.
+    SGLANG_ENABLE_PPU_KDA_REPLAYSSM_FLASHKDA = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.

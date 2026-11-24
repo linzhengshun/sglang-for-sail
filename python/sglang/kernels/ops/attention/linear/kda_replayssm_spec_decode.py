@@ -267,6 +267,29 @@ def commit_native_kda_replayssm_ppu(
     commit(state, correction, key, decay, indices, accept_lens, tracks, steps)
 
 
+@register_custom_op(mutates_args=["state"])
+def commit_flashkda_replayssm_ppu(
+    state: torch.Tensor,
+    correction: torch.Tensor,
+    key: torch.Tensor,
+    decay: torch.Tensor,
+    indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    tracks: Optional[torch.Tensor] = None,
+    steps: Optional[torch.Tensor] = None,
+) -> None:
+    from sglang.kernels.jit.kda_replayssm_ppu import _jit_module
+
+    if (tracks is None) != (steps is None):
+        raise ValueError("ReplaySSM track indices and steps must be paired")
+    if tracks is None:
+        _jit_module().commit(state, correction, key, decay, indices, accept_lens)
+    else:
+        _jit_module().commit_track(
+            state, correction, key, decay, indices, accept_lens, tracks, steps
+        )
+
+
 def commit_kda_replayssm_spec_all_layers(
     checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32, in place
     rawv_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, V]
@@ -362,13 +385,13 @@ def commit_kda_replayssm_after_verify(
     Single commit entry point shared by the generic spec_utils commit and the
     dspark/dflash direct `update_mamba_state_after_mtp_verify` path. The SSM state
     lives in the per-slot ring (written during verify); the fold replays the
-    accepted prefix into the fp32 checkpoint, so `temporal` stays current. Conv
-    still needs its usual accept-rollback.
+    accepted prefix into the resident checkpoint, so `temporal` stays current.
+    Conv still needs its usual accept-rollback.
     """
     from sglang.srt.environ import envs
     from sglang.srt.utils import is_sail, logger
 
-    correction = getattr(spec_state, "replayssm_correction", None)
+    correction = spec_state.replayssm_correction
     # Use the public PLA entry point only for its raw-input record format.
     # Width-major conv pools are passed as views; no packing or copy-back.
     if (
@@ -412,7 +435,12 @@ def commit_kda_replayssm_after_verify(
     )
 
     if correction is not None:
-        commit_native_kda_replayssm_ppu(
+        commit = (
+            commit_native_kda_replayssm_ppu
+            if envs.SGLANG_PPU_KDA_REPLAYSSM_NATIVE.get()
+            else commit_flashkda_replayssm_ppu
+        )
+        commit(
             spec_state.temporal,
             correction,
             spec_state.replayssm_normkey,

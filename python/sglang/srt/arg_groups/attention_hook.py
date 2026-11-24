@@ -471,10 +471,23 @@ def handle_linear_attn_backend(server_args: Any):
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
             )
-        if decode not in ("triton", "flashinfer"):
+        flashkda_replay = decode == "flashkda" and verify == "flashkda"
+        if (
+            verify == "flashkda"
+            and is_ppu_flashkda_supported()
+            and not envs.SGLANG_PPU_KDA_REPLAYSSM_NATIVE.get()
+            and (
+                not flashkda_replay or not envs.SGLANG_ENABLE_PPU_KDA_REPLAYSSM_FLASHKDA.get()
+            )
+        ):
             raise ValueError(
-                "--enable-linear-replayssm-spec requires the triton or "
-                "flashinfer linear-attn decode backend, got "
+                "FlashKDA ReplaySSM needs FlashKDA decode and verify with "
+                "SGLANG_ENABLE_PPU_KDA_REPLAYSSM_FLASHKDA=1."
+            )
+        if decode not in ("triton", "flashinfer") and not flashkda_replay:
+            raise ValueError(
+                "--enable-linear-replayssm-spec requires triton, flashinfer, or "
+                "FlashKDA ReplaySSM as the linear-attn decode backend, got "
                 f"--linear-attn-decode-backend={decode!r}."
             )
         from sglang.srt.speculative.ragged_verify import (
@@ -483,6 +496,17 @@ def handle_linear_attn_backend(server_args: Any):
         )
 
         ragged_mode = read_ragged_verify_mode()
+        if flashkda_replay and (
+            ragged_mode is not RaggedVerifyMode.STATIC
+            or (cfg.speculative_algorithm or "").upper() not in ("NEXTN", "EAGLE")
+            or not uses_kda_attention(model_config_of(server_args).hf_config)
+            or cfg.enable_unified_memory
+            or cfg.enable_page_major_kv_layout
+        ):
+            raise ValueError(
+                "FlashKDA ReplaySSM requires KDA, static top-1 NEXTN/EAGLE "
+                "verification, and direct Mamba slots."
+            )
         if ragged_mode is not RaggedVerifyMode.STATIC:
             # Ragged ring-writes need the KDA fold-every-commit family
             # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
@@ -529,7 +553,7 @@ def handle_linear_attn_backend(server_args: Any):
                 "_handle_linear_attn_backend",
                 mamba_ssm_dtype="float32",
             )
-        elif cfg.mamba_ssm_dtype != "float32":
+        elif cfg.mamba_ssm_dtype != "float32" and not flashkda_replay:
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
                 "compact checkpoint is materialized after each accepted "

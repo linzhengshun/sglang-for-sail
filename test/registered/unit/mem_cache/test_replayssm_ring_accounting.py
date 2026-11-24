@@ -3,16 +3,17 @@
 The memory solver charges this on top of mamba_cache_per_req so num_slots is not
 over-provisioned (the ring is allocated per slot but is NOT part of the state
 cache cost). Pins the arithmetic against hand-computed byte counts for the
-fold window (raw v / pre-norm k / g / beta) across both gate layouts: GDN
-per-head scalar g vs KDA per-K vector g (KDA also keeps the chunked d/k rings
-under spec, see MambaPool). If the MambaPool allocation changes shape, update
-both the allocation and this expectation together.
+fold window (raw v / pre-norm k / g / beta) and the external FlashKDA
+correction-record layout. GDN uses per-head scalar g while KDA uses per-K vector
+g (and keeps the chunked d/k rings under spec, see MambaPool). The FlashKDA
+layout contract is shared directly by sizing and allocation.
 """
 
 import pytest
 import torch
 
 from sglang.srt.configs.mamba_utils import (
+    FlashKDAReplaySSMLayout,
     KimiLinearCacheParams,
     KimiLinearStateShape,
     Mamba2CacheParams,
@@ -40,6 +41,13 @@ LAYERS = [0, 1]
 def _kda_params():
     shape = KimiLinearStateShape.create(
         tp_world_size=1, num_heads=4, head_dim=8, num_k_heads=4, head_k_dim=8
+    )
+    return KimiLinearCacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
+
+
+def _flashkda_params():
+    shape = KimiLinearStateShape.create(
+        tp_world_size=1, num_heads=2, head_dim=128, num_k_heads=2, head_k_dim=128
     )
     return KimiLinearCacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
 
@@ -82,6 +90,23 @@ class TestReplaySSMRingAccounting(CustomTestCase):
             _kda_params().replayssm_ring_bytes_per_req(record_len=RL),
             3200 * len(LAYERS),
         )
+
+    def test_flashkda_layout_drives_shape_and_sizing(self):
+        params = _flashkda_params()
+        layout = FlashKDAReplaySSMLayout.from_params(params, RL)
+        self.assertEqual(layout.tensor_shape(len(LAYERS), 7), (2, 7, 2, 8, 128))
+        self.assertEqual(
+            params.replayssm_ring_bytes_per_req(record_len=RL, flashkda_layout=layout),
+            3 * 2 * RL * 128 * 4 * len(LAYERS),
+        )
+
+    def test_flashkda_layout_rejects_mismatched_record_length(self):
+        params = _flashkda_params()
+        layout = FlashKDAReplaySSMLayout.from_params(params, RL)
+        with self.assertRaisesRegex(ValueError, "record lengths must match"):
+            params.replayssm_ring_bytes_per_req(
+                record_len=RL + 1, flashkda_layout=layout
+            )
 
     def test_zero_len_ring(self):
         self.assertEqual(_gdn_params().replayssm_ring_bytes_per_req(record_len=0), 0)

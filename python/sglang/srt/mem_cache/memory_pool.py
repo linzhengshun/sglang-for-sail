@@ -541,6 +541,7 @@ class MambaPool:
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
+        # External FlashKDA uses FP32 correction records instead of raw inputs.
         replayssm_correction: Optional[torch.Tensor] = None
         replayssm_normkey: Optional[torch.Tensor] = None
         replayssm_decay: Optional[torch.Tensor] = None
@@ -688,6 +689,13 @@ class MambaPool:
             enable_linear_replayssm_spec
             and ppu_kda_replayssm_native_enabled(cache_params)
         )
+        flashkda_layout = None
+        if enable_linear_replayssm_spec and not replayssm_ppu_native:
+            from sglang.srt.configs.mamba_utils import ppu_flashkda_replayssm_layout
+
+            flashkda_layout = ppu_flashkda_replayssm_layout(
+                cache_params, linear_replayssm_cache_len
+            )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -774,19 +782,34 @@ class MambaPool:
             replayssm_correction = replayssm_normkey = replayssm_decay = None
             if replayssm_ppu_native:
                 hv, v_dim, k_dim = temporal_state_shape
-                L = linear_replayssm_cache_len
-                record_len = L
-                if speculative_num_draft_tokens is None or L < speculative_num_draft_tokens:
+                record_len = linear_replayssm_cache_len
+                if speculative_num_draft_tokens is None or record_len < speculative_num_draft_tokens:
                     raise ValueError(
                         "Native KDA ReplaySSM records must cover the verify window"
                     )
-                shape = (num_mamba_layers, num_slots, hv, L, v_dim)
+                shape = (num_mamba_layers, size + 1, hv, record_len, v_dim)
                 replayssm_correction = torch.zeros(
                     shape, dtype=torch.float32, device=device
                 )
                 replayssm_normkey = torch.zeros_like(replayssm_correction)
                 replayssm_decay = torch.zeros_like(replayssm_correction)
-            if _replayssm_on and not replayssm_ppu_native:
+            elif flashkda_layout is not None:
+                record_len = flashkda_layout.record_len
+                if not (
+                    speculative_num_draft_tokens is not None
+                    and 1 <= speculative_num_draft_tokens <= min(record_len, 16)
+                ):
+                    raise ValueError(
+                        "FlashKDA ReplaySSM needs 1-16 verify tokens and a record "
+                        "window at least as long as the verify window."
+                    )
+                shape = flashkda_layout.tensor_shape(num_mamba_layers, size + 1)
+                replayssm_correction = torch.zeros(
+                    shape, dtype=torch.float32, device=device
+                )
+                replayssm_normkey = torch.zeros_like(replayssm_correction)
+                replayssm_decay = torch.zeros_like(replayssm_correction)
+            elif _replayssm_on:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
@@ -1043,6 +1066,8 @@ class MambaPool:
                 )
             if replayssm_ppu_native:
                 logger.info("Native PPU KDA ReplaySSM FP32 records: length=%s", record_len)
+            elif flashkda_layout is not None:
+                logger.info("FlashKDA ReplaySSM FP32 records: length=%s", record_len)
             elif _replayssm_on:
                 logger.info(
                     f"GDN ReplaySSM ring buffers allocated "

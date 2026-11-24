@@ -1369,9 +1369,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # fold replace the per-step snapshots). Pass None to the verify kernel so it
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
-        native_correction = getattr(mamba_cache_params, "replayssm_correction", None)
-        replayssm_on = replayssm_rawv is not None or native_correction is not None
-        if intermediate_state_cache is None and not replayssm_on:
+        native_correction = mamba_cache_params.replayssm_correction
+        if (
+            intermediate_state_cache is None
+            and replayssm_rawv is None
+            and native_correction is None
+        ):
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
@@ -1386,7 +1389,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # commit_lens of them (absorb overflow is bounded in-kernel).
         replayssm_rawk = replayssm_g = replayssm_beta = None
         ring_kwargs = {}
-        if replayssm_on:
+        if native_correction is not None:
+            if envs.SGLANG_PPU_KDA_REPLAYSSM_NATIVE.get():
+                ring_kwargs["native_replayssm"] = True
+            else:
+                ring_kwargs.update(
+                    native_correction=native_correction,
+                    native_key=mamba_cache_params.replayssm_normkey,
+                    native_decay=mamba_cache_params.replayssm_decay,
+                )
+            if not self.kernel_dispatcher.verify_backend.is_flashkda():
+                ring_kwargs["native_replayssm"] = True
+        elif replayssm_rawv is not None:
             replayssm_rawk = mamba_cache_params.replayssm_rawk
             replayssm_g = mamba_cache_params.replayssm_g
             replayssm_beta = mamba_cache_params.replayssm_beta
@@ -1564,7 +1578,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        if native_correction is not None:
+        if ring_kwargs.pop("native_replayssm", False):
             if ragged_layout is not None:
                 raise ValueError("Native PPU ReplaySSM requires dense linear verify")
             from sglang.kernels.jit.kda_replayssm_ppu import target_verify
@@ -1589,7 +1603,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             if self.kernel_dispatcher.verify_backend.is_flashkda():
                 ring_kwargs["is_ragged_verify"] = ragged_layout is not None
             core_attn_out = self.kernel_dispatcher.target_verify(
-            A_log=layer.A_log,
+                A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=q,
             k=k,

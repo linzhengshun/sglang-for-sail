@@ -476,8 +476,8 @@ class PPUFlashKDAKernel(FlashKDAKernel):
         if track_state is not None and state_chunk_size != _FLASHKDA_CHUNK_SIZE:
             raise ValueError("FlashKDA radix checkpoints require 64-token chunks")
 
-        # Aligned rows only read final_state; unaligned rows fall back to the
-        # existing Triton intermediate-state path.
+        # Aligned rows only read final_state; unaligned rows consume the sparse
+        # FP32 scratch instead of a full per-chunk intermediate state tensor.
         use_native = (
             lower_bound is not None
             and not is_spec_decode
@@ -571,6 +571,9 @@ class PPUFlashKDAKernel(FlashKDAKernel):
         cache_steps: int,
         retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
+        native_correction: Optional[torch.Tensor] = None,
+        native_key: Optional[torch.Tensor] = None,
+        native_decay: Optional[torch.Tensor] = None,
         is_ragged_verify: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -592,7 +595,20 @@ class PPUFlashKDAKernel(FlashKDAKernel):
             and b.shape == (1, seq_len, heads)
             and b.dtype == torch.bfloat16
         )
-        if intermediate_states_buffer is None:
+        if native_correction is not None:
+            if not dense:
+                raise ValueError(
+                    "FlashKDA ReplaySSM requires dense top-1 safe-gate verify"
+                )
+            flash_kda = _load_flash_kda(ppu=True)
+            verify = getattr(flash_kda, "verify_replayssm", None)
+            if not callable(verify):
+                raise RuntimeError(
+                    "PPU FlashKDA 0dfef21 with verify_replayssm is required."
+                )
+            verify_args = (native_correction, native_key, native_decay)
+            logger.info_once("FlashKDA ReplaySSM verify active")
+        elif intermediate_states_buffer is None:
             raise RuntimeError("FlashKDA verify cannot use a raw-input ReplaySSM ring")
         elif (
             dense
