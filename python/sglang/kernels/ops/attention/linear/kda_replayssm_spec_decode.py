@@ -32,9 +32,13 @@ Linear chain only (dspark γ chain, topk<=1).
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils.custom_op import register_custom_op
 
 # Measured on GB300 (K=V=128); any BV keeps the fold bit-identical, re-tune freely.
 KDA_FOLD_BLOCK_V = 8
@@ -247,6 +251,22 @@ def commit_kda_replayssm_spec(
     )
 
 
+@register_custom_op(mutates_args=["state"])
+def commit_native_kda_replayssm_ppu(
+    state: torch.Tensor,
+    correction: torch.Tensor,
+    key: torch.Tensor,
+    decay: torch.Tensor,
+    indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    tracks: Optional[torch.Tensor] = None,
+    steps: Optional[torch.Tensor] = None,
+) -> None:
+    from sglang.kernels.jit.kda_replayssm_ppu import commit
+
+    commit(state, correction, key, decay, indices, accept_lens, tracks, steps)
+
+
 def commit_kda_replayssm_spec_all_layers(
     checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32, in place
     rawv_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, V]
@@ -348,10 +368,12 @@ def commit_kda_replayssm_after_verify(
     from sglang.srt.environ import envs
     from sglang.srt.utils import is_sail, logger
 
-    # Use the public PLA entry point for both exact fold and conv rollback.
+    correction = getattr(spec_state, "replayssm_correction", None)
+    # Use the public PLA entry point only for its raw-input record format.
     # Width-major conv pools are passed as views; no packing or copy-back.
     if (
-        is_sail()
+        correction is None
+        and is_sail()
         and envs.SGLANG_SAIL_PLA_CUDA.get()
         and spec_state.temporal.dtype == torch.float32
         and spec_state.temporal.shape[-2:] == (128, 128)
@@ -389,22 +411,42 @@ def commit_kda_replayssm_after_verify(
         fused_conv_window_scatter_with_mask,
     )
 
-    L = spec_state.replayssm_rawv.shape[-2]
-    num_k_heads = spec_state.replayssm_rawk.shape[2]
-    commit_kda_replayssm_spec_all_layers(
-        checkpoint_state=spec_state.temporal,
-        rawv_cache=spec_state.replayssm_rawv,
-        rawk_cache=spec_state.replayssm_rawk,
-        gk_cache=spec_state.replayssm_g,
-        beta_cache=spec_state.replayssm_beta,
-        ssm_state_indices=state_batch_indices,
-        accept_lens=accept_lens,
-        max_cache_len=L,
-        num_k_heads=num_k_heads,
-        mamba_track_indices=mamba_track_indices,
-        mamba_steps_to_track=mamba_steps_to_track,
-        null_block_id=null_block_id,
-    )
+    if correction is not None:
+        commit_native_kda_replayssm_ppu(
+            spec_state.temporal,
+            correction,
+            spec_state.replayssm_normkey,
+            spec_state.replayssm_decay,
+            state_batch_indices.to(torch.int32).contiguous(),
+            accept_lens.to(torch.int32).contiguous(),
+            (
+                mamba_track_indices.to(torch.int32).contiguous()
+                if mamba_track_indices is not None
+                else None
+            ),
+            (
+                mamba_steps_to_track.to(torch.int32).contiguous()
+                if mamba_steps_to_track is not None
+                else None
+            ),
+        )
+    else:
+        L = spec_state.replayssm_rawv.shape[-2]
+        num_k_heads = spec_state.replayssm_rawk.shape[2]
+        commit_kda_replayssm_spec_all_layers(
+            checkpoint_state=spec_state.temporal,
+            rawv_cache=spec_state.replayssm_rawv,
+            rawk_cache=spec_state.replayssm_rawk,
+            gk_cache=spec_state.replayssm_g,
+            beta_cache=spec_state.replayssm_beta,
+            ssm_state_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            max_cache_len=L,
+            num_k_heads=num_k_heads,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+        )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
     # scatter is mask-gated (step -1 => skip).

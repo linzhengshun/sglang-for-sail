@@ -1332,7 +1332,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # fold replace the per-step snapshots). Pass None to the verify kernel so it
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
-        replayssm_on = replayssm_rawv is not None
+        native_correction = getattr(mamba_cache_params, "replayssm_correction", None)
+        replayssm_on = replayssm_rawv is not None or native_correction is not None
         if intermediate_state_cache is None and not replayssm_on:
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
@@ -1526,39 +1527,61 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        core_attn_out = self.kernel_dispatcher.target_verify(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            intermediate_states_buffer=intermediate_state_cache,
-            intermediate_state_indices=intermediate_state_indices,
-            cache_steps=draft_token_num,
-            retrieve_parent_token=retrieve_parent_token,
-            lower_bound=layer.lower_bound,
-            **ring_kwargs,
-            **(
-                dict(
-                    zip(
-                        ("fused_accept_state_indices", "fused_accept_num_accepted"),
-                        self._fused_accept_indices(
-                            cache_indices=cache_indices,
-                            query_start_loc=query_start_loc,
-                            intermediate_state_cache=intermediate_state_cache,
-                            draft_token_num=draft_token_num,
-                        ),
+        if native_correction is not None:
+            if ragged_layout is not None:
+                raise ValueError("Native PPU ReplaySSM requires dense linear verify")
+            from sglang.kernels.jit.kda_replayssm_ppu import target_verify
+
+            core_attn_out = target_verify(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                correction=native_correction,
+                key=mamba_cache_params.replayssm_normkey,
+                decay=mamba_cache_params.replayssm_decay,
+                lower_bound=layer.lower_bound,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+        else:
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+                lower_bound=layer.lower_bound,
+                **ring_kwargs,
+                **(
+                    dict(
+                        zip(
+                            ("fused_accept_state_indices", "fused_accept_num_accepted"),
+                            self._fused_accept_indices(
+                                cache_indices=cache_indices,
+                                query_start_loc=query_start_loc,
+                                intermediate_state_cache=intermediate_state_cache,
+                                draft_token_num=draft_token_num,
+                            ),
+                        )
                     )
-                )
-                if self.accept_lens_pool is not None
-                else {}
-            ),
-        )
+                    if self.accept_lens_pool is not None
+                    else {}
+                ),
+            )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the
             # uncovered tail rows; zero them so discarded pad hidden states

@@ -55,7 +55,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     saturate_to_fp8_range,
 )
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import (
+    BaseLinearStateParams,
+    ppu_kda_replayssm_native_enabled,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
@@ -538,6 +541,9 @@ class MambaPool:
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
+        replayssm_correction: Optional[torch.Tensor] = None
+        replayssm_normkey: Optional[torch.Tensor] = None
+        replayssm_decay: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -678,6 +684,10 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        replayssm_ppu_native = bool(
+            enable_linear_replayssm_spec
+            and ppu_kda_replayssm_native_enabled(cache_params)
+        )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -761,7 +771,22 @@ class MambaPool:
             # (--enable-linear-replayssm-spec) shares this allocation.
             replayssm_d = replayssm_k = replayssm_g = None
             replayssm_rawv = replayssm_rawk = replayssm_beta = None
-            if _replayssm_on:
+            replayssm_correction = replayssm_normkey = replayssm_decay = None
+            if replayssm_ppu_native:
+                hv, v_dim, k_dim = temporal_state_shape
+                L = linear_replayssm_cache_len
+                record_len = L
+                if speculative_num_draft_tokens is None or L < speculative_num_draft_tokens:
+                    raise ValueError(
+                        "Native KDA ReplaySSM records must cover the verify window"
+                    )
+                shape = (num_mamba_layers, num_slots, hv, L, v_dim)
+                replayssm_correction = torch.zeros(
+                    shape, dtype=torch.float32, device=device
+                )
+                replayssm_normkey = torch.zeros_like(replayssm_correction)
+                replayssm_decay = torch.zeros_like(replayssm_correction)
+            if _replayssm_on and not replayssm_ppu_native:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
@@ -977,6 +1002,9 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    replayssm_correction=replayssm_correction,
+                    replayssm_normkey=replayssm_normkey,
+                    replayssm_decay=replayssm_decay,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
@@ -1003,6 +1031,9 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    replayssm_correction=replayssm_correction,
+                    replayssm_normkey=replayssm_normkey,
+                    replayssm_decay=replayssm_decay,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -1010,7 +1041,9 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            if _replayssm_on:
+            if replayssm_ppu_native:
+                logger.info("Native PPU KDA ReplaySSM FP32 records: length=%s", record_len)
+            elif _replayssm_on:
                 logger.info(
                     f"GDN ReplaySSM ring buffers allocated "
                     f"(record_len={record_len}, fold={self.replayssm_spec_fold}): "
@@ -1260,6 +1293,9 @@ class MambaPool:
             "replayssm_rawv",
             "replayssm_rawk",
             "replayssm_beta",
+            "replayssm_correction",
+            "replayssm_normkey",
+            "replayssm_decay",
         }
     )
 

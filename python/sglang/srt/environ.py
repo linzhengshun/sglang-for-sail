@@ -295,6 +295,7 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    SGLANG_PPU_KDA_REPLAYSSM_NATIVE = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

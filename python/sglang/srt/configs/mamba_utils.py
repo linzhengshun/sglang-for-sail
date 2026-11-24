@@ -26,6 +26,21 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
+def ppu_kda_replayssm_native_enabled(params) -> bool:
+    if not params.is_kda or not envs.SGLANG_PPU_KDA_REPLAYSSM_NATIVE.get():
+        return False
+    from sglang.srt.runtime_context import get_exec, get_platform
+
+    hv, v_dim, k_dim = params.shape.temporal
+    return (
+        get_platform().is_ppu
+        and get_platform().device_sm == 89
+        and v_dim == k_dim == 128
+        and params.shape.num_k_heads_per_tp == hv
+        and get_exec().mamba.enable_linear_replayssm_spec
+    )
+
+
 def extra_groups_for_head_shards(ngroups: int, tp_size: int):
     """Compute the increase in group numbers to account for
     replication in order to accompany the head shards."""
@@ -134,6 +149,13 @@ class BaseLinearStateParams(ABC):
         """
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
+        if ppu_kda_replayssm_native_enabled(self):
+            return (
+                (hv * v_dim + h_k * k_dim + hv * k_dim)
+                * record_len
+                * torch.float32.itemsize
+                * len(self.layers)
+            )
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
         if self.is_kda:

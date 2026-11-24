@@ -85,6 +85,19 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.commit_native_kda_replayssm_ppu",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode:"
+            "commit_native_kda_replayssm_ppu"
+        ),
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(8, 9), max_sm=(8, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.indexer_q_quant_head_gate",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
