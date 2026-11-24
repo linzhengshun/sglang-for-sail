@@ -1,4 +1,4 @@
-"""AST-isolated CPU dispatch/state regressions for shifted MegaMHC.
+"""AST-isolated CPU dispatch/state regressions for MegaMHC boundaries.
 
 Execute the actual HcState and pre/post orchestration, with tensor/kernel and
 msgspec dependencies stubbed. This is not numerical or accelerator acceptance.
@@ -9,6 +9,7 @@ import ast
 import functools
 import logging
 import runpy
+import subprocess
 import sys
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -70,6 +71,7 @@ BASE_NS = load_definitions(
     ["CustomTestCase"],
     {
         "unittest": unittest,
+        "subprocess": subprocess,
         "envs": ENV_NS["envs"],
         "is_in_ci": lambda: False,
         "_wait_for_gpu_idle_in_ci": lambda: None,
@@ -286,11 +288,39 @@ class TestMegaMHCDispatch(MegaMHCFixture, CustomTestCase):
             (kw["hc_post_scale"], kw["rmsnorm_scale"], kw["num_sinkhorn_iters"]),
             (2.0, 1.0, 10),
         )
-        self.assertNotIn("y_fp8", kw)
+        self.assertIsNone(kw["y_fp8"])
         old = self.ns["mhc_mega_boundary"](*args, 1e-6, 1e-6, 1e-6, 10)
         self.assertEqual(len(old), 3)
         self.assertEqual(old[1].shape, normalized.shape)
         self.assertEqual([t.shape for t in old[2]], [t.shape for t in stats])
+
+    def test_non_shifted_contract_returns_no_next_pre(self):
+        args = inputs(hidden=4096)
+        args[2] = None
+        self.assertIsNone(
+            self.ns["try_mhc_mega_boundary"](*args, 1e-6, 2e-6, 3e-6, 10)
+        )
+        self.backend.mega_mhc.assert_not_called()
+        self.backend._C = SimpleNamespace(mega_mhc_h4096_fp32_variance=True)
+        self.ns["_mega_mhc_kernel"].cache_clear()
+        self.ns["ENABLE_JIT_DEEPGEMM"] = False
+        self.assertIsNone(
+            self.ns["try_mhc_mega_boundary"](*args, 1e-6, 2e-6, 3e-6, 10)
+        )
+        self.ns["ENABLE_JIT_DEEPGEMM"] = True
+        self.ns["_mega_mhc_kernel"].cache_clear()
+
+        updated, normalized, stats = self.ns["try_mhc_mega_boundary"](
+            *args, 1e-6, 2e-6, 3e-6, 10
+        )
+        kw = self.backend.mega_mhc.call_args.kwargs
+        self.assertIs(kw["new_residual"], updated)
+        self.assertIs(kw["y_bf16"], normalized)
+        self.assertIsNone(kw["shifted_prev_mix"])
+        self.assertIsNone(kw["new_prev_mix"])
+        self.assertIsNone(stats[0])
+        self.assertIs(stats[1].source, kw["new_post_mix"])
+        self.assertIs(stats[2], kw["new_comb_res_mix"])
 
     def test_invalid_inputs_decline_before_launch(self):
         cases = [inputs(0), inputs(hidden=5121), inputs(1 << 20 | 1)]
