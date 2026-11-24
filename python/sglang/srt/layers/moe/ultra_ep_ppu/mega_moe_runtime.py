@@ -59,7 +59,7 @@ def register_physical_weights(layer) -> None:
         raise ValueError("Invalid local master/replica geometry for FP8 MegaMoE")
 
     # Target and draft share the EP group but not the layer IDs or weight pools.
-    key = (id(group), layer.is_draft)
+    key = (id(group), getattr(layer, "is_draft", False))
     manager = _MANAGERS.get(key)
     if manager is None:
         manager = api.Manager(
