@@ -839,7 +839,8 @@ class TopK(BaseFusedOp):
         rows = hidden_states.shape[0]
         min_rows, max_rows = (2, 256) if parallel.attn_dp_size == 8 else (1, 512)
         if (
-            not get_moe_runner_backend().is_deep_gemm()
+            not hidden_states.is_cuda
+            or not get_moe_runner_backend().is_deep_gemm()
             or (parallel.attn_cp_size, parallel.attn_dp_size, parallel.moe_ep_size)
             not in ((4, 1, 4), (8, 1, 8), (1, 8, 8))
             or torch.cuda.get_device_capability(hidden_states.device) != (8, 9)
@@ -860,6 +861,7 @@ class TopK(BaseFusedOp):
             or cfg.correction_bias is None
             or cfg.correction_bias.dtype != torch.float32
             or cfg.correction_bias.ndim != 1
+            or cfg.correction_bias.device != hidden_states.device
             or cfg.output_format not in (None, TopKOutputFormat.STANDARD)
             or is_expert_remapping_enabled()
             or self.enable_waterfill

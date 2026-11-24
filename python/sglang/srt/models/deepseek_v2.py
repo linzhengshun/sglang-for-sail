@@ -1579,8 +1579,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             mega_topk_output = None
             if (
-                _is_sail
-                and not use_vision_topk
+                not use_vision_topk
                 and isinstance(self.topk, TopK)
                 and not getattr(self, "is_hash", False)
             ):
