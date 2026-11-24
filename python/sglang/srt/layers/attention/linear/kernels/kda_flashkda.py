@@ -496,7 +496,13 @@ class PPUFlashKDAKernel(FlashKDAKernel):
                     "support (0dfef21)."
                 )
             if track_state is not None:
-                use_native = False
+                use_native = (
+                    getattr(flash_kda, "SUPPORTS_FP32_TRACK_STATE", False)
+                    if use_fp32
+                    else flash_kda.supports_bf16_track_state(
+                        q.shape[2], ssm_states.dtype
+                    )
+                )
         if not use_native:
             return _triton_fallback(
                 q,

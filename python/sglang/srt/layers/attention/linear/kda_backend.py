@@ -1293,6 +1293,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            state_chunk_size=self.mamba_chunk_size,
             state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
             num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
             state_checkpoint_every_n_tokens=(
