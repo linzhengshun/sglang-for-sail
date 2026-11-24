@@ -7,6 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_sail, logger
 
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
@@ -484,9 +485,15 @@ class PPUFlashKDAKernel(FlashKDAKernel):
         )
         if use_native:
             flash_kda = _load_flash_kda(ppu=True)
-            if not getattr(flash_kda, "SUPPORTS_BF16_STATE_ACCUMULATION", False):
+            accum = get_exec().mamba.mamba_ssm_accum_dtype
+            use_fp32 = accum == "float32"
+            capability = "FP32" if use_fp32 else "BF16"
+            if not getattr(
+                flash_kda, f"SUPPORTS_{capability}_STATE_ACCUMULATION", False
+            ):
                 raise RuntimeError(
-                    "PPU FlashKDA prefill requires BF16 state accumulation support."
+                    f"PPU FlashKDA prefill requires {capability} state accumulation "
+                    "support (0dfef21)."
                 )
             if track_state is not None:
                 use_native = False
@@ -539,7 +546,7 @@ class PPUFlashKDAKernel(FlashKDAKernel):
             initial_state=initial_state,
             final_state=final_state,
             cu_seqlens=query_start_loc.to(torch.int64),
-            state_accum_dtype=torch.bfloat16,
+            state_accum_dtype=getattr(torch, accum),
             track_state=track_state,
             track_chunk_idx=track_chunk_idx,
         )
