@@ -531,6 +531,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_platform,
     get_serving,
     publish,
 )
@@ -2491,6 +2492,14 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
+        if (
+            model_info["is_generation"]
+            and get_platform().is_ppu
+            and get_exec().kernel.sampling_backend == "flashinfer"
+        ):
+            from flashinfer.sampling import get_sampling_module
+
+            get_sampling_module()
         if get_disagg().disaggregation_mode == "null":
             res = requests.post(
                 url + request_name,
