@@ -103,7 +103,28 @@ def test_topk_transform_method(prefill_impl, fp8_kv_cache, forward_mode, expecte
 def test_ppu_native_q8_uses_absolute_paged_ids():
     backend = _make_backend("flashmla_sparse_q8", fp8_kv_cache=False)
     backend._ppu_native_flat_fp8 = True
-    assert backend.get_topk_transform_method(ForwardMode.EXTEND) == PAGED
+    assert (
+        backend.get_topk_transform_method(ForwardMode.EXTEND)
+        == TopkTransformMethod.PAGED
+    )
+
+
+def test_ppu_native_q8_empty_batch_accepts_none_rope_and_preserves_dtype():
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    q_nope = torch.empty((0, 2, 512), dtype=torch.float32)
+
+    output = backend._forward_ppu_native_q8(
+        q_nope=q_nope,
+        q_rope=None,
+        kv_cache=None,
+        page_table_1=None,
+        sm_scale=1.0,
+        v_head_dim=512,
+        topk_length=None,
+    )
+
+    assert output.shape == (0, 2, 512)
+    assert output.dtype == q_nope.dtype
 
 
 @pytest.mark.parametrize(

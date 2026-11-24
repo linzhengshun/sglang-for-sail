@@ -3584,7 +3584,7 @@ class DeepseekSparseAttnBackend(
     def _forward_ppu_native_q8(
         self,
         q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         sm_scale: float,
@@ -3595,8 +3595,10 @@ class DeepseekSparseAttnBackend(
         first_prefill_chunk: bool = False,
     ) -> torch.Tensor:
         rows, heads, dim = q_nope.shape
+        if q_rope is None:
+            q_rope = q_nope.new_empty((rows, heads, 0))
         if rows == 0:
-            return q_nope.new_empty((0, heads, v_head_dim), dtype=torch.bfloat16)
+            return q_nope.new_empty((0, heads, v_head_dim))
         if (
             dim != 512
             or q_rope.shape[-1] != 0
