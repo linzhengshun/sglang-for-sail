@@ -1501,6 +1501,18 @@ def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
 
     if not (is_sail() and view.kv_cache_dtype == "fp8_e4m3"):
         return {}
+    mode = getattr(view, "disaggregation_mode", "null")
+    local_q8_backends = {
+        "prefill": (view.dsa_prefill_backend,),
+        "decode": (view.dsa_decode_backend,),
+        "null": (view.dsa_prefill_backend, view.dsa_decode_backend),
+    }.get(mode, ())
+    if (
+        get_platform().device_sm == 89
+        and local_q8_backends
+        and all(backend == "flashmla_sparse_q8" for backend in local_q8_backends)
+    ):
+        return {}
     dsa_flashmla_backends = ("flashmla_sparse", "flashmla_kv", "flashmla_auto")
     if view.decode_attention_backend != "flashmla":
         if "dsa" not in attention_backends_of(view):
