@@ -48,6 +48,30 @@ class TestPpuKimiK3Constraints(CustomTestCase):
         self.assertIs(dispatcher.extend_kernel, triton_kernel)
         self.assertIs(dispatcher.verify_kernel, triton_kernel)
 
+    def test_kda_dispatcher_uses_one_external_flashkda_kernel(self):
+        triton_kernel = SimpleNamespace(supports_packed_decode=False)
+        external_kernel = object()
+        with (
+            patch.object(kda_backend, "is_sail", return_value=True),
+            patch.object(kda_backend, "is_ppu_flashkda_supported", return_value=True),
+            patch.object(kda_backend, "TritonKDAKernel", return_value=triton_kernel),
+            patch.object(
+                kda_flashkda, "PPUFlashKDAKernel", return_value=external_kernel
+            ) as kernel_class,
+            patch.object(kda_backend, "rank0_log"),
+        ):
+            dispatcher = kda_backend.KDAKernelDispatcher(
+                LinearAttnKernelBackend.FLASHKDA,
+                LinearAttnKernelBackend.FLASHKDA,
+                LinearAttnKernelBackend.FLASHKDA,
+                explicit_flashkda_prefill=True,
+            )
+
+        self.assertIs(dispatcher.decode_kernel, external_kernel)
+        self.assertIs(dispatcher.extend_kernel, external_kernel)
+        self.assertIs(dispatcher.verify_kernel, external_kernel)
+        kernel_class.assert_called_once_with()
+
     def test_ppu_disables_pdl(self):
         with patch.object(jit_arch, "is_sail_runtime", return_value=True):
             self.assertFalse(jit_arch.is_arch_support_pdl.__wrapped__())

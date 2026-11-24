@@ -499,6 +499,17 @@ class ExecMamba(msgspec.Struct):
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    mamba_ssm_accum_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Resident SSM state accumulation dtype for explicit PPU FlashKDA "
+                "prefill, independent of --mamba-ssm-dtype. Other backends retain "
+                "their native accumulation behavior."
+            ),
+            choices=["float32", "bfloat16"],
+        ),
+    ] = "bfloat16"
     mamba_max_states_per_path: A[
         int,
         "Maximum number of cached Mamba states retained per root-to-tail path "
@@ -568,7 +579,7 @@ class ExecMamba(msgspec.Struct):
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows FlashInfer or PPU FlashKDA decode; otherwise uses Triton.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
         ),
     ] = None
