@@ -101,6 +101,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
     elif arch == "Glm5NextForConditionalGeneration" and cfg.disaggregation_mode != "null":
+        # PPU reports SM89 through device_sm; do not broaden this GLM layout to CUDA.
         ppu_mooncake_ep = (
             cfg.disaggregation_mode == "prefill"
             and cfg.disaggregation_transfer_backend == "mooncake"

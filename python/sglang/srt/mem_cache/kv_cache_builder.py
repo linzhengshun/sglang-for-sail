@@ -365,6 +365,7 @@ def build_kv_cache(
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
     bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(is_dsa=is_dsa)
+    # PPU reports SM89 through device_sm; do not broaden this GLM layout to CUDA.
     if (
         bypass_dsa_cp_prefix_cache
         and get_disagg().disaggregation_mode == "prefill"
