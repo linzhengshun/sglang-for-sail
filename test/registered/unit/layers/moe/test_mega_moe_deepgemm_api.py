@@ -33,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_model,
     get_parallel,
+    override_platform,
 )
 from sglang.srt.utils import is_sail
 
@@ -79,6 +80,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             self.assertEqual(mega_moe._mega_moe_mma_type(experts), "fp8xfp4")
             experts._mega_moe_mma_type = "bf16xfp4"
             self.assertEqual(mega_moe._mega_moe_mma_type(experts), "bf16xfp4")
+            experts._mega_moe_mma_type = "fp8xfp8"
+            self.assertEqual(mega_moe._mega_moe_mma_type(experts), "fp8xfp8")
         with patch.object(mega_moe, "_is_sail", False):
             self.assertEqual(mega_moe._mega_moe_mma_type(experts), "fp8xfp4")
 
@@ -586,6 +589,268 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     layer.w2_weight_scale.data_ptr(),
                     layer.mega_l2_weights[1].data_ptr(),
                 )
+
+    @contextmanager
+    def _ppu_fp8_scheme(
+        self,
+        *,
+        strategy="channel",
+        input_strategy="token",
+        dynamic=True,
+        a2a=MoeA2ABackend.MEGAMOE,
+    ):
+        from compressed_tensors.quantization import QuantizationArgs
+
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w8a8_fp8_moe as fp8_moe,
+        )
+
+        weights = QuantizationArgs(num_bits=8, type="float", strategy=strategy)
+        inputs = QuantizationArgs(
+            num_bits=8, type="float", strategy=input_strategy, dynamic=dynamic
+        )
+        if strategy == "tensor":
+            inputs = QuantizationArgs(
+                num_bits=8, type="float", strategy="tensor", dynamic=True
+            )
+        with (
+            patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}),
+            patch.object(fp8_moe, "is_sail", return_value=True),
+            override_platform(device_sm=89),
+            get_flags().moe.override(
+                a2a_backend=a2a, runner_backend=MoeRunnerBackend.AUTO
+            ),
+        ):
+            yield fp8_moe.CompressedTensorsW8A8Fp8MoE(weights, inputs)
+
+    def test_ppu_fp8_channelwise_weight_and_scale_layout(self):
+        def transform(l1, l2, *, quantization):
+            self.assertEqual(quantization, "channelwise")
+            self.assertEqual(l1[0].dtype, torch.float8_e4m3fn)
+            self.assertEqual(l1[1].dtype, torch.float32)
+            rows = torch.arange(256).reshape(2, 16, 8).transpose(0, 1).reshape(-1)
+            return (
+                l1[0].view(torch.uint8)[:, rows].view(l1[0].dtype),
+                l1[1][:, rows],
+            ), l2
+
+        self.deep_gemm.fp8_fp8_mega_moe = lambda *args, **kwargs: None
+        self.deep_gemm.transform_weights_for_fp8_mega_moe = transform
+        with self._ppu_fp8_scheme() as method:
+            layer = torch.nn.Module()
+            layer.with_bias = False
+            layer.num_fused_shared_experts = 0
+            layer.moe_tp_size = 1
+            layer._mega_moe_weights_built = False
+            method.create_weights(layer, 1, 256, 128, torch.bfloat16)
+            layer.w13_weight.data.copy_(
+                (torch.arange(256) * 0.25)[:, None]
+                .expand(256, 256)
+                .to(torch.float8_e4m3fn)
+            )
+            layer.w13_weight_scale.data.copy_(torch.arange(256).reshape(1, 256, 1) + 1)
+            layer.w2_weight.data.zero_()
+            original = layer.w13_weight.view(torch.uint8).clone()
+            w2_ptr = layer.w2_weight.data_ptr()
+            method.process_weights_after_loading(layer)
+            ptr = layer.w13_weight.data_ptr()
+            method.process_weights_after_loading(layer)
+
+            self.assertTrue(layer._mega_moe_weights_built)
+            self.assertEqual(layer._mega_moe_mma_type, "fp8xfp8")
+            self.assertEqual(layer.w13_weight.data_ptr(), ptr)
+            self.assertEqual(layer.mega_l1_weights[0].data_ptr(), ptr)
+            self.assertEqual(
+                layer.mega_l1_weights[1].data_ptr(), layer.w13_weight_scale.data_ptr()
+            )
+            self.assertEqual(layer.mega_l2_weights[0].data_ptr(), w2_ptr)
+            torch.testing.assert_close(
+                layer.w13_weight_scale[0, :16, 0],
+                torch.tensor([*range(1, 9), *range(129, 137)], dtype=torch.float32),
+            )
+            torch.testing.assert_close(
+                layer.w13_weight.view(torch.uint8)[:, :8], original[:, :8]
+            )
+            torch.testing.assert_close(
+                layer.w13_weight.view(torch.uint8)[:, 8:16], original[:, 128:136]
+            )
+            with self.assertRaisesRegex(RuntimeError, "MegaMoE forward path"):
+                method.apply_weights(layer, None)
+            with self.assertRaisesRegex(RuntimeError, "In-place reload"):
+                method.restore_weights_before_loading(layer)
+
+    def test_ppu_fp8_workspace_selects_channelwise_quantization(self):
+        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=(object(), object(), object())
+        )
+        group = object()
+        stream_a, stream_b = object(), object()
+        with (
+            patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}),
+            patch.object(mega_moe, "_is_sail", True),
+            patch.object(
+                torch.cuda, "current_stream", side_effect=(stream_a, stream_a, stream_b)
+            ),
+        ):
+            fp8_a = mega_moe._get_mega_moe_symm_buffer(
+                group, 8, 64, 2, 256, 128, mma_type="fp8xfp8"
+            )
+            fp8_a_again = mega_moe._get_mega_moe_symm_buffer(
+                group, 8, 64, 2, 256, 128, mma_type="fp8xfp8"
+            )
+            fp8_b = mega_moe._get_mega_moe_symm_buffer(
+                group, 8, 64, 2, 256, 128, mma_type="fp8xfp8"
+            )
+            fp4 = mega_moe._get_mega_moe_symm_buffer(
+                group, 8, 64, 2, 256, 128, mma_type="fp8xfp4"
+            )
+        self.assertIs(fp8_a, fp8_a_again)
+        self.assertIsNot(fp8_a, fp8_b)
+        self.assertIsNot(fp8_a, fp4)
+        kwargs = self.deep_gemm.get_symm_buffer_for_mega_moe.call_args_list
+        self.assertEqual(kwargs[0].kwargs["quantization"], "channelwise")
+        self.assertEqual(kwargs[1].kwargs["quantization"], "channelwise")
+        self.assertNotIn("quantization", kwargs[2].kwargs)
+
+    def test_ppu_fp8_runtime_active_idle_and_guards(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.mega_moe_pre_dispatch = MagicMock()
+        deep_gemm.fp8_fp8_mega_moe = MagicMock(
+            side_effect=lambda output, *_args, **_kwargs: output.fill_(2)
+        )
+        buffer = SimpleNamespace(
+            x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            _mega_moe_weights_built=True,
+            _mega_moe_mma_type="fp8xfp8",
+            _mega_moe_nvfp4=False,
+        )
+        group = SimpleNamespace(device_group=object())
+
+        @contextmanager
+        def common():
+            with ExitStack() as stack:
+                for manager in (
+                    patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                    patch.object(mega_moe, "_is_sail", True),
+                    patch.object(mega_moe, "_device_sm", 89),
+                    patch.object(
+                        mega_moe, "is_mega_moe_experts_ready", return_value=True
+                    ),
+                    patch.object(
+                        mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer
+                    ),
+                    patch.object(
+                        mega_moe,
+                        "_configure_mega_moe_deep_gemm_num_sms",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(
+                        mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                        "get",
+                        return_value=8,
+                    ),
+                    patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(moe_ep_group=group),
+                    ),
+                ):
+                    stack.enter_context(manager)
+                yield
+
+        with common(), patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            output = mega_moe.run_mega_routed_experts(
+                experts,
+                torch.ones((2, 4), dtype=torch.bfloat16),
+                torch.tensor([[0, 1], [2, 3]]),
+                torch.full((2, 2), 0.5),
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=2,
+                routed_scaling_factor=3.0,
+            )
+            idle = mega_moe.run_mega_routed_experts(
+                experts,
+                torch.empty((0, 4), dtype=torch.bfloat16),
+                None,
+                None,
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=0,
+            )
+            with self.assertRaisesRegex(ValueError, "separate shared experts"):
+                mega_moe.run_mega_routed_experts(
+                    experts,
+                    torch.ones((1, 4), dtype=torch.bfloat16),
+                    torch.tensor([[0, 1]]),
+                    torch.full((1, 2), 0.5),
+                    hidden_size=4,
+                    intermediate_size=8,
+                    top_k=2,
+                    num_tokens=1,
+                    num_shared_experts=1,
+                )
+        torch.testing.assert_close(output, torch.full_like(output, 6))
+        self.assertEqual(idle.shape, (0, 4))
+        self.assertEqual(deep_gemm.mega_moe_pre_dispatch.call_count, 2)
+        self.assertEqual(
+            deep_gemm.mega_moe_pre_dispatch.call_args_list[1].kwargs["num_tokens"],
+            0,
+        )
+        self.assertEqual(deep_gemm.fp8_fp8_mega_moe.call_count, 2)
+        self.assertEqual(deep_gemm.fp8_fp8_mega_moe.call_args_list[1].args[0].shape, (1, 4))
+        self.assertEqual(deep_gemm.mega_moe_pre_dispatch.call_args.kwargs["group_size"], 0)
+        with common(), patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "eager execution"):
+                mega_moe.run_mega_routed_experts(
+                    experts,
+                    torch.ones((1, 4), dtype=torch.bfloat16),
+                    torch.tensor([[0, 1]]),
+                    torch.full((1, 2), 0.5),
+                    hidden_size=4,
+                    intermediate_size=8,
+                    top_k=2,
+                    num_tokens=1,
+                )
+
+    def test_ppu_fp8_selector_rejects_graphs_and_oversized_batches(self):
+        experts = SimpleNamespace(
+            _mega_moe_weights_built=True, _mega_moe_mma_type="fp8xfp8"
+        )
+        moe = SimpleNamespace(experts=experts)
+        hidden_states = torch.empty(2, 256)
+        with (
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            patch.object(mega_moe, "_is_sail", True),
+            patch.object(mega_moe, "_device_sm", 89),
+            patch.object(mega_moe, "get_is_capture_mode", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "eager execution"):
+                mega_moe.should_use_mega_moe(moe, hidden_states)
+        with (
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            patch.object(mega_moe, "_is_sail", True),
+            patch.object(mega_moe, "_device_sm", 89),
+            patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+            patch.object(mega_moe, "get_dp_global_num_tokens", return_value=None),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                "get",
+                return_value=1,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no unpacked fallback"):
+                mega_moe.should_use_mega_moe(moe, hidden_states)
 
     def test_ppu_mxf4_rejects_expert_bias_before_conversion(self):
         from sglang.srt.layers.quantization import mxfp4
@@ -1375,6 +1640,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         mega_moe.is_mega_moe_experts_ready(
                             SimpleNamespace(_mega_moe_weights_built=False)
                         )
+                    )
+            fp8_experts = SimpleNamespace(
+                _mega_moe_weights_built=True, _mega_moe_mma_type="fp8xfp8"
+            )
+            for sm in (88, 89, 90):
+                with patch.object(mega_moe, "_device_sm", sm):
+                    self.assertEqual(
+                        mega_moe.is_mega_moe_experts_ready(fp8_experts), sm == 89
                     )
 
     def test_kimi_k3_situ_selects_ppu_mma_api_without_changing_cuda_path(self):

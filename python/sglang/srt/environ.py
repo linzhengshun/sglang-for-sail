@@ -1437,9 +1437,8 @@ class Envs:
     # Everything here is a developer knob for working ON kernels -- building
     # them, inspecting what the compiler produced, and benchmarking them. Flags
     # that select a kernel in production live with their own feature instead.
-    # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
-    # point it at a persistent mount to share builds across CI jobs.
-    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # JIT kernel build cache. Tracks SGLANG_CACHE_DIR unless explicitly set.
+    SGLANG_JIT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("jit"))
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
@@ -1518,6 +1517,8 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    SGLANG_OPT_ULTRA_EP_PPU = EnvBool(False)
+    SGLANG_OPT_ULTRA_EP_PPU_REDUNDANT_PER_RANK = EnvInt(0)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
@@ -2331,11 +2332,13 @@ class Envs:
     # prefill/extend path (kda_flashkda.FlashKDAKernel ->
     # pla.prefill.flashkdapro.flashkda_fwd). PPU defaults it to True in
     # platform_hook, so PLA is on out of the box; set it to 0 to send decode
-    # and prefill back to the community Triton kernels together. An explicit
-    # --linear-attn-prefill-backend still wins for the prefill side alone.
+    # and prefill back to the community Triton kernels together. Explicit
+    # FlashKDA on PPU SM89 uses the external package independently of this gate.
     SGLANG_SAIL_PLA_CUDA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_SAIL_FLA_CUDA"
     )
+    # External FlashKDA verify writes FP32 correction records instead of the PLA/raw ring.
+    SGLANG_PPU_KDA_REPLAYSSM_FLASHKDA = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.

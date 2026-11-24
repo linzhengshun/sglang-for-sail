@@ -115,14 +115,89 @@ def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     if cfg.moe_a2a_backend != "megamoe" or cfg.encoder_only:
         return
     validate_flydsl_decode_capacity(server_args)
+    from sglang.srt.layers.moe.ultra_ep_ppu import mega_moe_runtime
+
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        if mega_moe_runtime.is_enabled():
+            raise ValueError("UltraEP MegaMoE does not support instance connectors.")
         return
     model_config = model_config_of(server_args)
     model_arch = model_config.hf_config.architectures[0]
+    _validate_ppu_ultra_ep(cfg, model_arch, model_config.hf_quant_config)
     if mega_moe_needs_token_budget(
         model_arch, model_config.hf_quant_config, cfg.quantization
     ):
         validate_mega_moe_token_budget(server_args, model_arch)
+
+
+def _validate_ppu_ultra_ep(cfg, model_arch: str, hf_quant_config: dict) -> None:
+    from sglang.srt.layers.moe.ultra_ep_ppu import mega_moe_runtime
+
+    if not mega_moe_runtime.is_enabled():
+        return
+    platform = get_platform()
+    if not platform.is_ppu or platform.device_sm != 89:
+        raise ValueError("UltraEP MegaMoE requires PPU SM89.")
+    if (
+        cfg.disaggregation_mode != "prefill"
+        or cfg.nnodes != 1
+        or cfg.pp_size != 1
+        or (cfg.tp_size, cfg.ep_size, cfg.attn_cp_size) != (8, 8, 8)
+        or not cfg.enable_prefill_cp
+        or cfg.cp_strategy != "interleave"
+    ):
+        raise ValueError(
+            "UltraEP MegaMoE requires single-node TP8/CP8/EP8 PD prefill "
+            "with interleave CP."
+        )
+    if not cfg.disable_overlap_schedule:
+        raise ValueError("UltraEP MegaMoE requires --disable-overlap-schedule.")
+    groups = hf_quant_config.get("config_groups") or {}
+    channelwise_fp8 = any(
+        (weights := group.get("weights") or {}).get("strategy") == "channel"
+        and weights.get("type") == "float"
+        and weights.get("num_bits") == 8
+        and (activations := group.get("input_activations") or {}).get("strategy")
+        == "token"
+        and activations.get("type") == "float"
+        and activations.get("num_bits") == 8
+        and activations.get("dynamic") is True
+        for group in groups.values()
+    )
+    if (
+        model_arch != "Glm5NextForConditionalGeneration"
+        or hf_quant_config.get("quant_method") != "compressed-tensors"
+        or not channelwise_fp8
+        or not cfg.disable_shared_experts_fusion
+        or cfg.enforce_shared_experts_fusion
+    ):
+        raise ValueError(
+            "UltraEP MegaMoE requires GLM-5.3-Flash channelwise FP8 and "
+            "--disable-shared-experts-fusion."
+        )
+    if (
+        cfg.enable_eplb
+        or cfg.enable_eplb_async
+        or cfg.enable_waterfill
+        or cfg.ep_num_redundant_experts
+        or cfg.ep_dispatch_algorithm is not None
+        or cfg.init_expert_location != "trivial"
+        or cfg.expert_distribution_recorder_mode is not None
+    ):
+        raise ValueError("UltraEP MegaMoE must be the only expert placement owner.")
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    graph = cfg.cuda_graph_config
+    if (
+        graph is None
+        or graph.prefill.backend != Backend.DISABLED
+        or graph.decode.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "UltraEP MegaMoE requires eager execution; use --disable-cuda-graph."
+        )
+    mega_moe_runtime.redundant_per_rank()
 
 
 def mega_moe_decode_tokens_per_rank(cfg) -> int:
