@@ -411,7 +411,10 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     routing = None
-    if should_use_mega_gate(moe, hidden_states, forward_batch):
+    if (
+        getattr(moe.experts, "_mega_moe_mma_type", None) != "fp8xfp8"
+        and should_use_mega_gate(moe, hidden_states, forward_batch)
+    ):
         import deep_gemm
 
         # CUDA fp8xfp4 can skip the top-k copy (kCopyTopk); PPU pre-dispatch
@@ -431,23 +434,28 @@ def _run_mega_routed(
         topk_weights = routing.topk_weights
         routed_scaling_factor = routing.routed_scaling_factor
     elif num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        if (
+        topk_output = None
+        use_vision_topk = (
             not moe.is_hash
             and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+        )
+        if (
+            _is_sail
+            and not moe.is_hash
+            and not use_vision_topk
+            and getattr(moe.experts, "_mega_moe_mma_type", None) == "fp8xfp8"
         ):
-            topk_output = vision_topk(
-                moe,
-                router_logits,
-                input_ids_global,
-            )
-        else:
-            topk_output = moe.topk(
-                hidden_states,
-                router_logits,
-                **topk_kwargs,
-            )
+            from sglang.srt.layers.moe.topk import TopK
+
+            if isinstance(moe.topk, TopK):
+                topk_output = moe.topk.try_mega_gate(hidden_states, moe.gate.weight)
+        if topk_output is None:
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+            if use_vision_topk:
+                topk_output = vision_topk(moe, router_logits, input_ids_global)
+            else:
+                topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+                topk_output = moe.topk(hidden_states, router_logits, **topk_kwargs)
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
         if valid_rows is not None:
