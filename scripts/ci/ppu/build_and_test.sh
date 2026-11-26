@@ -158,5 +158,10 @@ python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 cd "$artifacts"
 python3 "$repo/scripts/ci/ppu/run_speculative_sanity.py" \
     2>&1 | tee "$artifacts/sanity.log"
-# Require both selected sanity files; update this count when extending either suite.
-grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+# Require every selected file; update these counts when extending either suite.
+if [[ "${PPU_CI_FP8_ONLY:-0}" == "1" ]]; then
+    expected_summary='Test Summary: 2/2 passed'
+else
+    expected_summary='Test Summary: 4/4 passed'
+fi
+grep -Fxq "$expected_summary" "$artifacts/sanity.log"
