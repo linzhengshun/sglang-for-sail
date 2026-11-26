@@ -248,8 +248,6 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 "the mamba track path needs per-chunk fp32 states "
                 "(why=intermediate-states), which the fused kernel does not emit"
             )
-        if is_sail() and not ppu_pla_prefill_gate_open():
-            return "the PPU SAIL PLA prefill gate is closed (SGLANG_SAIL_PLA_CUDA)"
         if not self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
@@ -352,7 +350,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         out_buf = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
 
-        if is_sail():
+        if ppu_pla_prefill_gate_open():
             from pla.prefill.flashkdapro import flashkda_fwd
 
             logger.info_once(
