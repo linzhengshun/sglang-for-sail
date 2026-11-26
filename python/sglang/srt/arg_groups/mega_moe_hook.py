@@ -139,16 +139,21 @@ def _validate_ppu_ultra_ep(cfg, model_arch: str, hf_quant_config: dict) -> None:
     if not platform.is_ppu or platform.device_sm != 89:
         raise ValueError("UltraEP MegaMoE requires PPU SM89.")
     if (
-        cfg.disaggregation_mode != "prefill"
+        (
+            cfg.disaggregation_mode,
+            cfg.tp_size,
+            cfg.ep_size,
+            cfg.attn_cp_size,
+        )
+        not in (("null", 4, 4, 4), ("null", 8, 8, 8), ("prefill", 8, 8, 8))
         or cfg.nnodes != 1
         or cfg.pp_size != 1
-        or (cfg.tp_size, cfg.ep_size, cfg.attn_cp_size) != (8, 8, 8)
         or not cfg.enable_prefill_cp
         or cfg.cp_strategy != "interleave"
     ):
         raise ValueError(
-            "UltraEP MegaMoE requires single-node TP8/CP8/EP8 PD prefill "
-            "with interleave CP."
+            "UltraEP MegaMoE requires single-node interleave CP: "
+            "standalone TP4/CP4/EP4 or TP8/CP8/EP8, or TP8/CP8/EP8 PD prefill."
         )
     if not cfg.disable_overlap_schedule:
         raise ValueError("UltraEP MegaMoE requires --disable-overlap-schedule.")
