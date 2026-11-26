@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run selected single-device PPU smoke and FP8 operator files."""
+"""Run selected single-device PPU model, numerical and benchmark files."""
 
 import os
 from pathlib import Path
@@ -9,6 +9,10 @@ from sglang.test.ci.ci_register import HWBackend, collect_tests
 SMOKE_FILES = (
     "test/registered/core/test_basic_sanity_eagle3.py",
     "test/registered/core/test_basic_sanity_dflash.py",
+)
+FLASHKDA_FILES = (
+    "test/registered/kernels/ops/attention/test_flashkda_replayssm_ppu.py",
+    "test/registered/kernels/benchmark/attention/bench_flashkda_replayssm_ppu.py",
 )
 FP8_FILES = (
     "test/registered/kernels/ops/moe/test_fp8_mega_moe_ppu.py",
@@ -23,7 +27,8 @@ SUITE = "stage-a-test-1-gpu-ppu"
 
 
 def selected_files(board):
-    return SMOKE_FILES + (NATIVE_Q8_FILES if board == SM89_BOARD else ())
+    optional = (FLASHKDA_FILES + NATIVE_Q8_FILES) if board == SM89_BOARD else ()
+    return SMOKE_FILES + optional
 
 
 def select_tests(repo, board=None):
@@ -44,7 +49,7 @@ def select_tests(repo, board=None):
     ]
     if len(tests) != len(paths) or {test.filename for test in tests} != paths:
         raise ValueError(
-            "all selected single-device smoke and FP8 operator files must be "
+            "all selected model, numerical and benchmark files must be "
             "registered for the PPU lane"
         )
     return tests

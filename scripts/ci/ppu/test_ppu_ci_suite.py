@@ -42,7 +42,7 @@ class TestPPUCISuite(unittest.TestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
-    def test_ppu_suite_contains_smoke_and_native_q8_files(self):
+    def test_ppu_suite_contains_model_numerical_and_benchmark_files(self):
         registered = RUNNER.parent / "registered"
         for board, expected in (
             (
@@ -50,6 +50,8 @@ class TestPPUCISuite(unittest.TestCase):
                 [
                     "core/test_basic_sanity_eagle3.py",
                     "core/test_basic_sanity_dflash.py",
+                    "kernels/ops/attention/test_flashkda_replayssm_ppu.py",
+                    "kernels/benchmark/attention/bench_flashkda_replayssm_ppu.py",
                     "kernels/ops/attention/test_dsa_native_q8_ppu.py",
                     "kernels/benchmark/attention/bench_dsa_native_q8_ppu.py",
                 ],
@@ -108,13 +110,13 @@ class TestPPUCISuite(unittest.TestCase):
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
             )
             for summary, exit_code, expected in (
-                ("Test Summary: 4/4 passed", 0, 0),
+                ("Test Summary: 6/6 passed", 0, 0),
                 ("Test Summary: 0/0 passed", 0, 1),
                 ("Test Summary: 1/1 passed", 0, 1),
-                ("Test Summary: 3/4 passed", 0, 1),
+                ("Test Summary: 5/6 passed", 0, 1),
                 ("Test Summary: 3/3 passed", 0, 1),
-                ("Test Summary: 4/4 passed", 7, 7),
-                ("Test Summary: 4/4 passed (incomplete)", 0, 1),
+                ("Test Summary: 6/6 passed", 7, 7),
+                ("Test Summary: 6/6 passed (incomplete)", 0, 1),
                 ("", 0, 1),
             ):
                 with self.subTest(summary=summary, exit_code=exit_code):
@@ -134,6 +136,21 @@ class TestPPUCISuite(unittest.TestCase):
                     self.assertEqual(
                         result.returncode, expected, result.stdout + result.stderr
                     )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=dict(
+                    os.environ,
+                    repo=str(root),
+                    artifacts=str(artifacts),
+                    PPU_CI_FP8_ONLY="1",
+                    FIXTURE_SUMMARY="Test Summary: 2/2 passed",
+                    FIXTURE_EXIT="0",
+                ),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class TestPPUCIWorkflow(unittest.TestCase):
